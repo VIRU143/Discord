@@ -1,111 +1,80 @@
+import os
 import discord
 from discord import app_commands
-import os
-from dotenv import load_dotenv
-import uvicorn
-from fastapi import FastAPI
-import asyncio
-from contextlib import asynccontextmanager
-import datetime
-import logging
+from flask import Flask
+from threading import Thread
 
-# Set up logging for better visibility
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Flask app for keeping the bot alive on Render
+app = Flask(__name__)
 
-# Load environment variables
-load_dotenv()
+@app.route('/')
+def home():
+    return "Bot is running!"
 
-# --- Configuration ---
-TOKEN = os.getenv('BOT_TOKEN')
-PORT = int(os.environ.get('PORT', 8000)) # Use environment PORT provided by Render
-HOST = os.environ.get('HOST', '0.0.0.0')
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
 
-if not TOKEN:
-    logging.error("FATAL: BOT_TOKEN environment variable is not set. Exiting.")
-    exit()
-
-# --- Discord Bot Setup ---
-class MinimalBot(discord.Client):
-    """
-    A minimal Discord client that includes a command tree for slash commands.
-    """
-    def __init__(self, *, intents: discord.Intents):
+# Discord Bot
+class SimpleBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
-    async def on_ready(self):
-        """Called when the bot is ready and connected to Discord."""
-        logging.info(f'Successfully logged in as {self.user} (ID: {self.user.id})')
-        await self.change_presence(activity=discord.Activity(
-            type=discord.ActivityType.watching, 
-            name="for /ping commands"
-        ))
-        
-        # Synchronize commands globally (only needs to be done once per change)
+    async def setup_hook(self):
+        # Sync commands globally
         await self.tree.sync()
-        logging.info('Slash commands synchronized successfully.')
-        
-    @app_commands.command(name="ping", description="Replies with Pong! This interaction counts for the Active Developer Badge.")
-    async def ping_command(self, interaction: discord.Interaction):
-        """The command logic for /ping."""
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        await interaction.response.send_message(
-            f"Pong! Interaction successful at `{timestamp}`. \n\n"
-            "**Active Developer Badge Note:** This command execution has been registered with Discord!",
-            ephemeral=True
-        )
-        logging.info(f'[Interaction] /ping command executed by {interaction.user}.')
+        print("Slash commands synced!")
 
-# Create bot instance with required intents
-intents = discord.Intents.default()
-intents.guilds = True # Required for slash commands
-client = MinimalBot(intents=intents)
+    async def on_ready(self):
+        print(f'✅ Logged in as {self.user}')
+        print('🚀 Bot is ready for Active Developer badge!')
+        print('💡 Use /ping or /hello in your server')
 
-# --- FastAPI Setup ---
+bot = SimpleBot()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """
-    Manages the lifecycle of the Discord bot client within the FastAPI event loop.
-    Starts the bot client when the server starts and stops it when the server shuts down.
-    """
-    logging.info("FastAPI Server Startup: Starting Discord client task...")
+# Simple slash commands
+@bot.tree.command(name="ping", description="Check bot latency")
+async def ping(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    await interaction.response.send_message(f"🏓 Pong! Latency: {latency}ms")
+
+@bot.tree.command(name="hello", description="Say hello")
+async def hello(interaction: discord.Interaction):
+    await interaction.response.send_message(f"👋 Hello {interaction.user.mention}! Keep using commands for Active Developer badge!")
+
+@bot.tree.command(name="active", description="Info about Active Developer badge")
+async def active_info(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎯 Active Developer Badge",
+        description="Use slash commands regularly to qualify!",
+        color=0x00ff00
+    )
+    embed.add_field(
+        name="How to get it",
+        value="1. Use slash commands daily\n2. Keep bot active\n3. Wait 1-2 weeks\n4. Claim at: https://discord.com/developers/active-developer",
+        inline=False
+    )
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="user", description="Get user info")
+async def user_info(interaction: discord.Interaction):
+    user = interaction.user
+    embed = discord.Embed(title=f"👤 {user.display_name}", color=user.accent_color or 0x7289da)
+    embed.set_thumbnail(url=user.display_avatar.url)
+    embed.add_field(name="ID", value=user.id, inline=True)
+    embed.add_field(name="Account Created", value=user.created_at.strftime("%Y-%m-%d"), inline=True)
+    await interaction.response.send_message(embed=embed)
+
+if __name__ == "__main__":
+    # Start Flask server in a thread
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
     
-    # Start the Discord client in a separate background task
-    # Note: We use client.start() instead of client.run() which is blocking
-    client_task = asyncio.create_task(client.start(TOKEN))
-    
-    yield # Server is ready to receive requests
-    
-    # --- Server Shutdown ---
-    logging.info("FastAPI Server Shutdown: Closing Discord client...")
-    if not client.is_closed():
-        await client.close()
-    
-    # Cancel the Discord client task
-    client_task.cancel()
-    
-    logging.info("FastAPI Server Shutdown: Cleanup complete.")
-
-
-# Initialize the FastAPI application using the defined lifespan
-app = FastAPI(
-    title="Discord Active Developer Bot API",
-    version="1.0.0",
-    description="Minimal Web Service to host an asynchronous Discord Bot on Render.",
-    lifespan=lifespan
-)
-
-@app.get("/")
-async def health_check():
-    """Endpoint for Render's health check."""
-    return {
-        "status": "online",
-        "bot_user": str(client.user) if client.is_ready() else "Connecting...",
-        "message": "The Discord bot is running and listening for interactions."
-    }
-
-# This file does not run uvicorn.run() directly. 
-# The Render Start Command will execute Uvicorn via the command line.
-# See README.md for the correct Start Command.
+    # Start Discord bot
+    token = os.getenv('DISCORD_TOKEN')
+    if not token:
+        print("❌ ERROR: DISCORD_TOKEN not found in environment variables")
+    else:
+        bot.run(token)
