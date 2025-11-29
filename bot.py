@@ -2,21 +2,23 @@ import discord
 from discord import app_commands
 import os
 from dotenv import load_dotenv
-from flask import Flask
-from threading import Thread
+import uvicorn
+from fastapi import FastAPI
+import asyncio
+from contextlib import asynccontextmanager
 import datetime
 import logging
 
-# Set up logging
+# Set up logging for better visibility
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Load environment variables from a .env file (for local testing)
-# Render will handle these via its environment settings.
+# Load environment variables
 load_dotenv()
 
 # --- Configuration ---
-# Get the bot token from environment variables
 TOKEN = os.getenv('BOT_TOKEN')
+PORT = int(os.environ.get('PORT', 8000)) # Use environment PORT provided by Render
+HOST = os.environ.get('HOST', '0.0.0.0')
 
 if not TOKEN:
     logging.error("FATAL: BOT_TOKEN environment variable is not set. Exiting.")
@@ -29,7 +31,6 @@ class MinimalBot(discord.Client):
     """
     def __init__(self, *, intents: discord.Intents):
         super().__init__(intents=intents)
-        # Tree is the command processor for application commands
         self.tree = app_commands.CommandTree(self)
 
     async def on_ready(self):
@@ -40,58 +41,71 @@ class MinimalBot(discord.Client):
             name="for /ping commands"
         ))
         
-        # After logging in, synchronize the commands with Discord
+        # Synchronize commands globally (only needs to be done once per change)
         await self.tree.sync()
         logging.info('Slash commands synchronized successfully.')
         
-    @app_commands.command(name="ping", description="Replies with Pong! This counts as an active interaction.")
+    @app_commands.command(name="ping", description="Replies with Pong! This interaction counts for the Active Developer Badge.")
     async def ping_command(self, interaction: discord.Interaction):
         """The command logic for /ping."""
         timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Respond ephemerally (only the user can see it)
         await interaction.response.send_message(
             f"Pong! Interaction successful at `{timestamp}`. \n\n"
-            "**Note:** This command execution has been registered by Discord and counts towards the **Active Developer Badge** requirement!",
+            "**Active Developer Badge Note:** This command execution has been registered with Discord!",
             ephemeral=True
         )
-        logging.info(f'[Interaction] /ping command executed by {interaction.user} in {interaction.guild.name}.')
+        logging.info(f'[Interaction] /ping command executed by {interaction.user}.')
 
-
-# Create bot instance with required intents (Guilds is needed for slash commands)
+# Create bot instance with required intents
 intents = discord.Intents.default()
-intents.guilds = True
+intents.guilds = True # Required for slash commands
 client = MinimalBot(intents=intents)
 
+# --- FastAPI Setup ---
 
-# --- Flask Web Server Setup (For Render Hosting) ---
-# Render Web Services require an open port to stay alive.
-app = Flask(__name__)
-PORT = int(os.environ.get('PORT', 8080)) # Use environment PORT provided by Render
-
-@app.route('/')
-def home():
-    """Simple health check endpoint."""
-    bot_status = f"{client.user.name} is online." if client.is_ready() else "Bot is connecting..."
-    return f"<h1>Discord Bot Health Check</h1><p>Status: {bot_status}</p><p>Web server is running on port {PORT}.</p>"
-
-def run_flask_server():
-    """Runs the Flask server."""
-    logging.info(f"Starting Flask web server on port {PORT}")
-    # Run the Flask app on 0.0.0.0 to bind correctly in the container environment
-    app.run(host='0.0.0.0', port=PORT)
-
-# --- Main Execution ---
-if __name__ == '__main__':
-    # Run the Flask server in a separate thread to prevent it from blocking the bot's loop
-    web_server_thread = Thread(target=run_flask_server)
-    web_server_thread.start()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Manages the lifecycle of the Discord bot client within the FastAPI event loop.
+    Starts the bot client when the server starts and stops it when the server shuts down.
+    """
+    logging.info("FastAPI Server Startup: Starting Discord client task...")
     
-    # Run the Discord bot client (blocking call, runs indefinitely)
-    try:
-        client.run(TOKEN)
-    except discord.errors.LoginFailure as e:
-        logging.critical(f"Failed to log in: {e}")
-        logging.critical("Please check your BOT_TOKEN.")
-    except Exception as e:
-        logging.critical(f"An unexpected error occurred: {e}")
+    # Start the Discord client in a separate background task
+    # Note: We use client.start() instead of client.run() which is blocking
+    client_task = asyncio.create_task(client.start(TOKEN))
+    
+    yield # Server is ready to receive requests
+    
+    # --- Server Shutdown ---
+    logging.info("FastAPI Server Shutdown: Closing Discord client...")
+    if not client.is_closed():
+        await client.close()
+    
+    # Cancel the Discord client task
+    client_task.cancel()
+    
+    logging.info("FastAPI Server Shutdown: Cleanup complete.")
+
+
+# Initialize the FastAPI application using the defined lifespan
+app = FastAPI(
+    title="Discord Active Developer Bot API",
+    version="1.0.0",
+    description="Minimal Web Service to host an asynchronous Discord Bot on Render.",
+    lifespan=lifespan
+)
+
+@app.get("/")
+async def health_check():
+    """Endpoint for Render's health check."""
+    return {
+        "status": "online",
+        "bot_user": str(client.user) if client.is_ready() else "Connecting...",
+        "message": "The Discord bot is running and listening for interactions."
+    }
+
+# This file does not run uvicorn.run() directly. 
+# The Render Start Command will execute Uvicorn via the command line.
+# See README.md for the correct Start Command.
