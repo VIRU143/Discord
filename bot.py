@@ -1,169 +1,97 @@
-import os
-import json
-import asyncio
-from datetime import datetime, timedelta
-import logging
 import discord
-from discord.ext import commands
 from discord import app_commands
-# Removed: import concurrent.futures (since we removed file I/O)
+import os
+from dotenv import load_dotenv
+from flask import Flask
+from threading import Thread
+import datetime
+import logging
 
-# ---------- REQUIRED FOR RENDER ----------
-from fastapi import FastAPI
-import uvicorn
-import threading
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ---------- ENV VARS ----------
-TOKEN = os.getenv("TOKEN")
-TEST_GUILD_ID = os.getenv("TEST_GUILD_ID")
-# Removed: WARNINGS_FILE = os.getenv("WARNINGS_FILE", "warnings.json")
+# Load environment variables from a .env file (for local testing)
+# Render will handle these via its environment settings.
+load_dotenv()
+
+# --- Configuration ---
+# Get the bot token from environment variables
+TOKEN = os.getenv('BOT_TOKEN')
 
 if not TOKEN:
-    logging.error("TOKEN is missing! Add it in Render → Environment Variables")
-    raise SystemExit("TOKEN is missing! Add it in Render → Environment Variables")
+    logging.error("FATAL: BOT_TOKEN environment variable is not set. Exiting.")
+    exit()
 
-# ---------- LOGGING ----------
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("bot")
+# --- Discord Bot Setup ---
+class MinimalBot(discord.Client):
+    """
+    A minimal Discord client that includes a command tree for slash commands.
+    """
+    def __init__(self, *, intents: discord.Intents):
+        super().__init__(intents=intents)
+        # Tree is the command processor for application commands
+        self.tree = app_commands.CommandTree(self)
 
-# ---------- INTENTS ----------
+    async def on_ready(self):
+        """Called when the bot is ready and connected to Discord."""
+        logging.info(f'Successfully logged in as {self.user} (ID: {self.user.id})')
+        await self.change_presence(activity=discord.Activity(
+            type=discord.ActivityType.watching, 
+            name="for /ping commands"
+        ))
+        
+        # After logging in, synchronize the commands with Discord
+        await self.tree.sync()
+        logging.info('Slash commands synchronized successfully.')
+        
+    @app_commands.command(name="ping", description="Replies with Pong! This counts as an active interaction.")
+    async def ping_command(self, interaction: discord.Interaction):
+        """The command logic for /ping."""
+        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Respond ephemerally (only the user can see it)
+        await interaction.response.send_message(
+            f"Pong! Interaction successful at `{timestamp}`. \n\n"
+            "**Note:** This command execution has been registered by Discord and counts towards the **Active Developer Badge** requirement!",
+            ephemeral=True
+        )
+        logging.info(f'[Interaction] /ping command executed by {interaction.user} in {interaction.guild.name}.')
+
+
+# Create bot instance with required intents (Guilds is needed for slash commands)
 intents = discord.Intents.default()
 intents.guilds = True
-intents.members = True
-intents.messages = True
-intents.message_content = True
-
-# ---------- BOT ----------
-bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
-# Removed: file_lock = asyncio.Lock()
-# Removed: executor = concurrent.futures.ThreadPoolExecutor(max_workers=5) 
-
-# In-memory dictionary to store warnings (resets on restart)
-# If persistent storage is needed later, this can be easily reintroduced with file I/O or a database.
-in_memory_warnings = {} 
+client = MinimalBot(intents=intents)
 
 
-# ---------- BAD WORDS ----------
-BAD_WORDS = {"badword1", "badword2", "swear1", "curse1"}
+# --- Flask Web Server Setup (For Render Hosting) ---
+# Render Web Services require an open port to stay alive.
+app = Flask(__name__)
+PORT = int(os.environ.get('PORT', 8080)) # Use environment PORT provided by Render
 
-# Removed: LOAD WARNINGS (Synchronous, called once at startup)
-# Removed: save_warnings (Asynchronous, non-blocking)
-
-
-# ---------- UTIL ----------
-def find_badwords(text):
-    return [w for w in BAD_WORDS if w in text.lower()]
-
-# ---------- ON READY ----------
-@bot.event
-async def on_ready():
-    log.info(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    try:
-        if TEST_GUILD_ID:
-            guild = discord.Object(id=int(TEST_GUILD_ID))
-            await bot.tree.sync(guild=guild)
-            log.info("Synced slash commands instantly (guild)")
-        else:
-            await bot.tree.sync()
-            log.info("Synced global slash commands")
-    except Exception as e:
-        log.error(f"Error syncing slash commands: {e}")
-
-    log.info(f"{bot.user} is online!")
-
-# ---------- SLASH COMMANDS ----------
-@bot.tree.command(name="hello", description="Ping test slash command")
-async def hello(interaction: discord.Interaction):
-    await interaction.response.send_message("Hello! Slash command working ✔️")
-
-@bot.tree.command(name="warnings", description="View the current warning count for a member or the full in-memory data.")
-@app_commands.describe(member="The member whose warnings you want to check.", full_data="Set to True to view all in-memory warnings data for this guild (JSON).")
-@app_commands.guild_only() 
-async def warnings_command(interaction: discord.Interaction, member: discord.Member, full_data: bool = False):
-    # Simple check: Ensure the user has permission to kick members (common moderator permission)
-    if not interaction.user.guild_permissions.kick_members:
-        return await interaction.response.send_message(
-            "You need 'Kick Members' permission to use this command.", ephemeral=True
-        )
-
-    gid = str(interaction.guild.id)
-    uid = str(member.id)
-
-    if full_data:
-        # Display full guild data in JSON format
-        guild_data = in_memory_warnings.get(gid, {})
-        if not guild_data:
-            response = f"No warnings recorded for this guild yet in this session."
-        else:
-            response = f"## ⚠️ In-Memory Warnings for {interaction.guild.name}\n"
-            response += "```json\n"
-            response += json.dumps(guild_data, indent=2)
-            response += "\n```"
-        
-        await interaction.response.send_message(response, ephemeral=True)
-        return
-
-    # Check warnings for a specific member
-    user_warnings = in_memory_warnings.get(gid, {}).get(uid, {"warnings": 0})["warnings"]
-    
-    if user_warnings == 0:
-        await interaction.response.send_message(
-            f"✅ {member.display_name} has no warnings recorded in this session.", ephemeral=True
-        )
-    else:
-        await interaction.response.send_message(
-            f"⚠️ {member.display_name} has **{user_warnings}** warnings recorded in this session.", ephemeral=False
-        )
-
-# ---------- BAD WORD HANDLER ----------
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author.bot or not message.guild:
-        return
-
-    bad = find_badwords(message.content)
-    if bad:
-        gid = str(message.guild.id)
-        uid = str(message.author.id)
-
-        # Update in-memory storage (this data is lost when the bot restarts)
-        if gid not in in_memory_warnings:
-            in_memory_warnings[gid] = {}
-        if uid not in in_memory_warnings[gid]:
-            in_memory_warnings[gid][uid] = {"warnings": 0}
-
-        in_memory_warnings[gid][uid]["warnings"] += 1
-        current_warnings = in_memory_warnings[gid][uid]['warnings']
-        
-        # Delete and warn
-        try:
-            await message.delete()
-            await message.channel.send(
-                f"⚠️ {message.author.mention}, bad words detected: **{', '.join(bad)}**. You have **{current_warnings}** warnings (in this session).",
-                delete_after=10
-            )
-        except discord.Forbidden:
-            log.warning(f"Could not delete message or send warning in {message.guild.name}. Check bot permissions.")
-
-
-    await bot.process_commands(message)
-
-# ---------- FASTAPI KEEP-ALIVE (REQUIRED FOR RENDER) ----------
-app = FastAPI()
-
-@app.get("/")
+@app.route('/')
 def home():
-    """Simple endpoint to satisfy Render's health check."""
-    return {"status": "running", "bot_user": bot.user.name if bot.user else "Starting..."}
+    """Simple health check endpoint."""
+    bot_status = f"{client.user.name} is online." if client.is_ready() else "Bot is connecting..."
+    return f"<h1>Discord Bot Health Check</h1><p>Status: {bot_status}</p><p>Web server is running on port {PORT}.</p>"
 
-def run_fastapi():
-    """Runs the Uvicorn/FastAPI server in a separate thread."""
-    log.info("Starting FastAPI Uvicorn server on port 10000...")
-    uvicorn.run(app, host="0.0.0.0", port=10000, log_level="warning")
+def run_flask_server():
+    """Runs the Flask server."""
+    logging.info(f"Starting Flask web server on port {PORT}")
+    # Run the Flask app on 0.0.0.0 to bind correctly in the container environment
+    app.run(host='0.0.0.0', port=PORT)
 
-# Start the web server thread
-threading.Thread(target=run_fastapi, daemon=True).start()
-
-# ---------- RUN ----------
-# This command runs the main event loop for the Discord bot
-bot.run(TOKEN)
+# --- Main Execution ---
+if __name__ == '__main__':
+    # Run the Flask server in a separate thread to prevent it from blocking the bot's loop
+    web_server_thread = Thread(target=run_flask_server)
+    web_server_thread.start()
+    
+    # Run the Discord bot client (blocking call, runs indefinitely)
+    try:
+        client.run(TOKEN)
+    except discord.errors.LoginFailure as e:
+        logging.critical(f"Failed to log in: {e}")
+        logging.critical("Please check your BOT_TOKEN.")
+    except Exception as e:
+        logging.critical(f"An unexpected error occurred: {e}")
