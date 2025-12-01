@@ -1,0 +1,46 @@
+# render.yaml
+services:
+  - type: web
+    name: discord-bot
+    env: python
+    region: oregon  # or singapore, frankfurt, etc.
+    plan: free
+    branch: main
+    
+    # Build configuration
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    
+    # Start command - crucial for Render
+    startCommand: python main.py
+    
+    # Health check (keeps service active)
+    healthCheckPath: /health
+    healthCheckTimeout: 30
+    
+    # Auto-deploy
+    autoDeploy: true
+    
+    # Environment variables
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "true"
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          type: web
+          name: discord-bot
+          property: url
+      - key: RENDER
+        value: "true"
+    
+    # Disk and resources
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    
+    # Scaling (free tier limited)
+    numInstances: 1
